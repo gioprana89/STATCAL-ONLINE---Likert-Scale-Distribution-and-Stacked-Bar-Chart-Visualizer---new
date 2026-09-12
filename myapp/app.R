@@ -6,13 +6,13 @@
 # install.packages(c(
 #   "shiny", "shinydashboard", "DT", "readxl", "dplyr", "tidyr",
 #   "ggplot2", "shinycssloaders", "scales", "openxlsx",
-#   "colourpicker", "officer", "flextable"
+#   "colourpicker", "officer", "flextable", "base64enc"
 # ))
 
 required_packages <- c(
   "shiny", "shinydashboard", "DT", "readxl", "dplyr", "tidyr",
   "ggplot2", "shinycssloaders", "scales", "openxlsx",
-  "colourpicker", "officer", "flextable"
+  "colourpicker", "officer", "flextable", "base64enc"
 )
 
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
@@ -40,18 +40,20 @@ library(flextable)
 
 
 # ============================================================
-# SHINYLIVE / CHROMIUM DOWNLOAD WORKAROUND
+# SHINYLIVE / STATIC HOSTING DOWNLOAD STRATEGY
 # ============================================================
-# In Chromium-based browsers (Chrome, Edge, etc.), the HTML5 "download"
-# attribute used by shiny::downloadButton() can conflict with Shinylive.
-# The symptom is a failed download named like download_xxx.txt / "No file".
-# Removing the attribute lets Shinylive intercept the download request
-# and transfer the file from webR's virtual filesystem to the browser.
-downloadButton <- function(...) {
-  tag <- shiny::downloadButton(...)
-  tag$attribs$download <- NULL
-  tag
-}
+# Binary exports are NOT delivered through Shiny downloadHandler URLs.
+# In GitHub Pages + Shinylive/webR, those dynamic session URLs can fail
+# when the Service Worker loses the parent-page/session mapping.
+#
+# Instead, STATCAL:
+# 1. creates the file inside webR's virtual filesystem,
+# 2. validates the generated binary file,
+# 3. Base64-encodes it in R,
+# 4. sends it to JavaScript with session$sendCustomMessage(),
+# 5. reconstructs it as a browser Blob and starts a normal download.
+#
+# This approach is used for PNG, Excel, and Word exports.
 
 
 # ============================================================
@@ -60,7 +62,7 @@ downloadButton <- function(...) {
 
 APP_NAME <- "STATCAL ONLINE"
 APP_TITLE <- "Likert Scale Distribution and Stacked Bar Chart Visualizer"
-APP_UPDATED <- "Last updated on September 9, 2026"
+APP_UPDATED <- "Last updated on September 12, 2026"
 SAMPLE_DATA_PATH <- "data_likert.xlsx"
 WEBSITE_URL <- "https://statcal.com/"
 URL_DATA_TRAINING <- "https://drive.google.com/drive/folders/1QMSiOx2NeB6Rj1j9lmmEK_Im-8YaLFNE?usp=sharing"
@@ -504,7 +506,7 @@ create_stacked_bar_plot <- function(chart_df, levels, manual_colors,
   chart_df$Y_Value <- if (y_metric == "Frequency") chart_df$Frequency else chart_df$Percentage
   chart_df$Response <- factor(as.character(chart_df$Response), levels = levels)
   chart_df$Label <- ""
-
+  
   if (label_mode == "Frequency") {
     chart_df$Label <- ifelse(chart_df$Frequency > 0, as.character(chart_df$Frequency), "")
   } else if (label_mode == "Percentage") {
@@ -516,17 +518,17 @@ create_stacked_bar_plot <- function(chart_df, levels, manual_colors,
       ""
     )
   }
-
+  
   default_y_label <- if (y_metric == "Frequency") "Frequency" else "Percentage (%)"
   y_label <- if (!is.null(y_axis_title) && nzchar(trimws(y_axis_title))) y_axis_title else default_y_label
   x_label <- if (!is.null(x_axis_title) && nzchar(trimws(x_axis_title))) x_axis_title else "Item Pertanyaan"
   legend_title <- if (is.null(legend_title)) "" else as.character(legend_title)
-
+  
   if (is.null(legend_labels) || length(legend_labels) != length(levels)) {
     legend_labels <- levels
     names(legend_labels) <- levels
   }
-
+  
   p <- ggplot(chart_df, aes(x = `Item Pertanyaan`, y = Y_Value, fill = Response)) +
     geom_col(width = bar_width, color = "white", linewidth = 0.25) +
     scale_fill_manual(
@@ -547,7 +549,7 @@ create_stacked_bar_plot <- function(chart_df, levels, manual_colors,
       legend_position = legend_position,
       x_text_angle = x_text_angle
     )
-
+  
   if (show_labels && label_mode != "None") {
     p <- p + geom_text(
       aes(label = Label),
@@ -557,19 +559,409 @@ create_stacked_bar_plot <- function(chart_df, levels, manual_colors,
       check_overlap = TRUE
     )
   }
-
+  
   if (facet_by_split && any(as.character(chart_df$Split) != "All")) {
     facet_scales <- ifelse(is.null(facet_scales) || !(facet_scales %in% c("fixed", "free_y", "free_x", "free")), "fixed", facet_scales)
     p <- p + facet_wrap(~ Split, ncol = split_panel_cols, scales = facet_scales)
   }
-
+  
   if (orientation == "Horizontal") p <- p + coord_flip()
-
+  
   p + theme(plot.background = element_rect(fill = th$figure_facecolor, color = NA))
 }
 
+
 # ============================================================
-# ROBUST EXPORT HELPERS - SESSION TEMP FILE + downloadHandler
+# AUTOMATIC WORD INTERPRETATION HELPERS
+# ============================================================
+# These functions create descriptive narratives from the same long-format
+# Likert distribution objects used by the tables and stacked bar chart.
+# The narrative is descriptive only and does not imply statistical
+# significance, causality, or inferential differences between groups.
+
+safe_pct_text <- function(x, digits = 2) {
+  x <- suppressWarnings(as.numeric(x))
+  if (length(x) == 0 || is.na(x) || !is.finite(x)) return("NA")
+  paste0(format(round(x, digits), nsmall = digits, trim = TRUE, scientific = FALSE), "%")
+}
+
+response_display_label <- function(response_value, legend_labels) {
+  response_value <- as.character(response_value)
+  if (!is.null(legend_labels) && response_value %in% names(legend_labels)) {
+    out <- as.character(legend_labels[[response_value]])
+    if (length(out) > 0 && !is.na(out) && nzchar(trimws(out))) return(trimws(out))
+  }
+  response_value
+}
+
+add_word_paragraphs <- function(doc, paragraphs) {
+  if (is.null(paragraphs) || length(paragraphs) == 0) return(doc)
+  for (txt in paragraphs) {
+    if (!is.null(txt) && length(txt) > 0 && !is.na(txt) && nzchar(trimws(as.character(txt)))) {
+      doc <- officer::body_add_par(doc, as.character(txt), style = "Normal")
+    }
+  }
+  doc
+}
+
+build_likert_word_narratives <- function(overall_long_df,
+                                         split_long_df,
+                                         levels,
+                                         legend_labels,
+                                         split_var = "None",
+                                         digits = 2,
+                                         chart_metric = "Percentage",
+                                         facet_by_split = TRUE,
+                                         language = "Bahasa Indonesia") {
+  
+  overall_long_df <- as.data.frame(overall_long_df)
+  split_long_df <- as.data.frame(split_long_df)
+  levels <- as.character(levels)
+  
+  if (length(levels) == 0 || nrow(overall_long_df) == 0) {
+    return(list(
+      table1 = character(0),
+      table2 = character(0),
+      figure1 = character(0),
+      table3 = character(0)
+    ))
+  }
+  
+  is_id <- identical(language, "Bahasa Indonesia")
+  
+  # ---------- Overall distribution ----------
+  overall_resp <- overall_long_df %>%
+    dplyr::group_by(Response) %>%
+    dplyr::summarise(Frequency = sum(Frequency, na.rm = TRUE), .groups = "drop")
+  
+  total_item_responses <- sum(overall_resp$Frequency, na.rm = TRUE)
+  overall_resp$Share <- if (total_item_responses > 0) {
+    overall_resp$Frequency / total_item_responses * 100
+  } else {
+    NA_real_
+  }
+  
+  overall_resp$Response_chr <- as.character(overall_resp$Response)
+  overall_resp$Response_chr <- factor(overall_resp$Response_chr, levels = levels)
+  overall_resp <- overall_resp[order(overall_resp$Response_chr), , drop = FALSE]
+  
+  dom_overall <- overall_resp[order(-overall_resp$Share), , drop = FALSE][1, , drop = FALSE]
+  dom_overall_label <- response_display_label(dom_overall$Response[1], legend_labels)
+  dom_overall_pct <- safe_pct_text(dom_overall$Share[1], digits)
+  
+  item_order <- base::levels(overall_long_df$`Item Pertanyaan`)
+  if (is.null(item_order) || length(item_order) == 0) {
+    item_order <- unique(as.character(overall_long_df$`Item Pertanyaan`))
+  }
+  
+  item_dom <- overall_long_df %>%
+    dplyr::mutate(
+      Item_chr = as.character(`Item Pertanyaan`),
+      Response_chr = as.character(Response)
+    ) %>%
+    dplyr::group_by(Item_chr) %>%
+    dplyr::arrange(dplyr::desc(Percentage), .by_group = TRUE) %>%
+    dplyr::slice_head(n = 1) %>%
+    dplyr::ungroup()
+  
+  dom_counts <- item_dom %>%
+    dplyr::count(Response_chr, name = "N_Items") %>%
+    dplyr::arrange(dplyr::desc(N_Items), Response_chr)
+  
+  most_common_dom <- if (nrow(dom_counts) > 0) dom_counts[1, , drop = FALSE] else NULL
+  strongest_item <- if (nrow(item_dom) > 0) item_dom[order(-item_dom$Percentage), , drop = FALSE][1, , drop = FALSE] else NULL
+  
+  # ---------- Table 1 narrative ----------
+  table1 <- character(0)
+  
+  if (is_id) {
+    table1 <- c(
+      table1,
+      paste0(
+        "Tabel distribusi Likert merangkum ", length(item_order),
+        " item pertanyaan dengan total ", format(total_item_responses, big.mark = ".", scientific = FALSE),
+        " respons item yang valid. Secara keseluruhan, kategori respons yang paling banyak muncul adalah \"",
+        dom_overall_label, "\" dengan proporsi ", dom_overall_pct, "."
+      )
+    )
+    
+    if (!is.null(most_common_dom) && nrow(most_common_dom) > 0) {
+      lbl <- response_display_label(most_common_dom$Response_chr[1], legend_labels)
+      table1 <- c(
+        table1,
+        paste0(
+          "Jika dilihat berdasarkan kategori dengan persentase terbesar pada masing-masing item, respons \"",
+          lbl, "\" paling sering menjadi kategori dominan, yaitu pada ",
+          most_common_dom$N_Items[1], " dari ", length(item_order), " item."
+        )
+      )
+    }
+    
+    if (!is.null(strongest_item) && nrow(strongest_item) > 0) {
+      lbl <- response_display_label(strongest_item$Response_chr[1], legend_labels)
+      table1 <- c(
+        table1,
+        paste0(
+          "Dominasi kategori respons paling kuat terdapat pada item \"",
+          strongest_item$Item_chr[1], "\", dengan kategori \"", lbl,
+          "\" sebesar ", safe_pct_text(strongest_item$Percentage[1], digits),
+          ". Hasil ini bersifat deskriptif dan menunjukkan pola distribusi jawaban pada data yang dianalisis."
+        )
+      )
+    }
+  } else {
+    table1 <- c(
+      table1,
+      paste0(
+        "The Likert distribution table summarizes ", length(item_order),
+        " question items with a total of ", format(total_item_responses, big.mark = ",", scientific = FALSE),
+        " valid item responses. Overall, the most frequent response category is \"",
+        dom_overall_label, "\" with a share of ", dom_overall_pct, "."
+      )
+    )
+    
+    if (!is.null(most_common_dom) && nrow(most_common_dom) > 0) {
+      lbl <- response_display_label(most_common_dom$Response_chr[1], legend_labels)
+      table1 <- c(
+        table1,
+        paste0(
+          "Based on the largest percentage within each item, the response \"",
+          lbl, "\" is the most frequently dominant category, leading in ",
+          most_common_dom$N_Items[1], " of ", length(item_order), " items."
+        )
+      )
+    }
+    
+    if (!is.null(strongest_item) && nrow(strongest_item) > 0) {
+      lbl <- response_display_label(strongest_item$Response_chr[1], legend_labels)
+      table1 <- c(
+        table1,
+        paste0(
+          "The strongest single-item concentration occurs for item \"",
+          strongest_item$Item_chr[1], "\", where the category \"", lbl,
+          "\" accounts for ", safe_pct_text(strongest_item$Percentage[1], digits),
+          ". These results are descriptive and summarize the observed response distribution."
+        )
+      )
+    }
+  }
+  
+  # ---------- Table 2 narrative ----------
+  use_split <- !is.null(split_var) && split_var != "None" &&
+    nrow(split_long_df) > 0 &&
+    any(as.character(split_long_df$Split) != "All")
+  
+  table2 <- character(0)
+  
+  if (!use_split) {
+    if (is_id) {
+      table2 <- c(
+        "Variabel pemisah belum dipilih. Oleh karena itu, tabel berdasarkan split menampilkan distribusi yang sama dengan tabel frekuensi keseluruhan dan belum memberikan perbandingan antar-kelompok."
+      )
+    } else {
+      table2 <- c(
+        "No split variable is selected. Therefore, the split table represents the same overall distribution as the frequency table and does not yet provide a between-group comparison."
+      )
+    }
+  } else {
+    split_summary <- split_long_df %>%
+      dplyr::mutate(
+        Split_chr = as.character(Split),
+        Response_chr = as.character(Response)
+      ) %>%
+      dplyr::group_by(Split_chr, Response_chr) %>%
+      dplyr::summarise(Frequency = sum(Frequency, na.rm = TRUE), .groups = "drop") %>%
+      dplyr::group_by(Split_chr) %>%
+      dplyr::mutate(
+        GroupTotal = sum(Frequency, na.rm = TRUE),
+        Share = ifelse(GroupTotal > 0, Frequency / GroupTotal * 100, NA_real_)
+      ) %>%
+      dplyr::ungroup()
+    
+    split_dom <- split_summary %>%
+      dplyr::group_by(Split_chr) %>%
+      dplyr::arrange(dplyr::desc(Share), .by_group = TRUE) %>%
+      dplyr::slice_head(n = 1) %>%
+      dplyr::ungroup()
+    
+    split_levels <- unique(as.character(split_long_df$Split))
+    split_levels <- split_levels[!is.na(split_levels) & nzchar(split_levels)]
+    
+    max_groups_to_narrate <- min(length(split_levels), 8L)
+    group_sentences <- character(0)
+    
+    if (nrow(split_dom) > 0) {
+      for (i in seq_len(min(nrow(split_dom), max_groups_to_narrate))) {
+        lbl <- response_display_label(split_dom$Response_chr[i], legend_labels)
+        if (is_id) {
+          group_sentences <- c(
+            group_sentences,
+            paste0(
+              split_dom$Split_chr[i], ": kategori dominan \"", lbl,
+              "\" (", safe_pct_text(split_dom$Share[i], digits), ")"
+            )
+          )
+        } else {
+          group_sentences <- c(
+            group_sentences,
+            paste0(
+              split_dom$Split_chr[i], ": dominant category \"", lbl,
+              "\" (", safe_pct_text(split_dom$Share[i], digits), ")"
+            )
+          )
+        }
+      }
+    }
+    
+    last_level <- tail(levels, 1)
+    last_label <- response_display_label(last_level, legend_labels)
+    
+    last_level_share <- split_summary[
+      split_summary$Response_chr == last_level,
+      c("Split_chr", "Share"),
+      drop = FALSE
+    ]
+    
+    if (is_id) {
+      table2 <- c(
+        table2,
+        paste0(
+          "Tabel split membandingkan distribusi jawaban berdasarkan variabel \"",
+          split_var, "\" yang terdiri atas ", length(split_levels), " kelompok. ",
+          "Kategori respons dominan pada masing-masing kelompok adalah: ",
+          paste(group_sentences, collapse = "; "), "."
+        )
+      )
+    } else {
+      table2 <- c(
+        table2,
+        paste0(
+          "The split table compares response distributions across the variable \"",
+          split_var, "\", consisting of ", length(split_levels), " groups. ",
+          "The dominant response category in each group is: ",
+          paste(group_sentences, collapse = "; "), "."
+        )
+      )
+    }
+    
+    if (nrow(last_level_share) > 1 && any(is.finite(last_level_share$Share))) {
+      max_row <- last_level_share[which.max(last_level_share$Share), , drop = FALSE]
+      min_row <- last_level_share[which.min(last_level_share$Share), , drop = FALSE]
+      
+      if (is_id) {
+        table2 <- c(
+          table2,
+          paste0(
+            "Untuk kategori respons terakhir dalam urutan skala, yaitu \"", last_label,
+            "\", proporsi terbesar terdapat pada kelompok \"", max_row$Split_chr[1],
+            "\" sebesar ", safe_pct_text(max_row$Share[1], digits),
+            ", sedangkan proporsi terkecil terdapat pada kelompok \"",
+            min_row$Split_chr[1], "\" sebesar ", safe_pct_text(min_row$Share[1], digits),
+            ". Perbedaan ini merupakan perbandingan deskriptif dan tidak menunjukkan signifikansi statistik."
+          )
+        )
+      } else {
+        table2 <- c(
+          table2,
+          paste0(
+            "For the last response category in the specified scale order, \"", last_label,
+            "\", the largest share is observed in group \"", max_row$Split_chr[1],
+            "\" at ", safe_pct_text(max_row$Share[1], digits),
+            ", while the smallest share is observed in group \"",
+            min_row$Split_chr[1], "\" at ", safe_pct_text(min_row$Share[1], digits),
+            ". This is a descriptive comparison and does not imply statistical significance."
+          )
+        )
+      }
+    }
+  }
+  
+  # ---------- Figure narrative ----------
+  metric_text_id <- if (identical(chart_metric, "Frequency")) "frekuensi" else "persentase"
+  metric_text_en <- if (identical(chart_metric, "Frequency")) "frequency" else "percentage"
+  
+  if (is_id) {
+    figure1 <- c(
+      paste0(
+        "Gambar stacked bar memvisualisasikan distribusi respons Likert berdasarkan ",
+        metric_text_id, ". Setiap warna merepresentasikan satu kategori respons sesuai urutan skala yang telah ditentukan. ",
+        "Segmen yang lebih besar menunjukkan frekuensi atau proporsi respons yang lebih besar pada item yang bersangkutan."
+      )
+    )
+    if (use_split && isTRUE(facet_by_split)) {
+      figure1 <- c(
+        figure1,
+        paste0(
+          "Grafik ditampilkan dalam panel berdasarkan variabel \"", split_var,
+          "\", sehingga pola distribusi antar-kelompok dapat dibandingkan secara visual menggunakan sumber data yang sama dengan tabel split."
+        )
+      )
+    }
+    figure1 <- c(
+      figure1,
+      paste0(
+        "Secara keseluruhan, kategori \"", dom_overall_label,
+        "\" merupakan respons yang paling dominan pada data terpilih dengan proporsi ",
+        dom_overall_pct, ". Interpretasi grafik ini bersifat deskriptif."
+      )
+    )
+  } else {
+    figure1 <- c(
+      paste0(
+        "The stacked bar chart visualizes the Likert response distribution using ",
+        metric_text_en, ". Each color represents one response category according to the specified scale order. ",
+        "Larger segments indicate a greater frequency or proportion of responses for the corresponding item."
+      )
+    )
+    if (use_split && isTRUE(facet_by_split)) {
+      figure1 <- c(
+        figure1,
+        paste0(
+          "The chart is displayed in panels based on the variable \"", split_var,
+          "\", allowing visual comparison of response patterns across groups using the same distribution data as the split table."
+        )
+      )
+    }
+    figure1 <- c(
+      figure1,
+      paste0(
+        "Overall, the category \"", dom_overall_label,
+        "\" is the most dominant response in the selected data, accounting for ",
+        dom_overall_pct, ". The chart interpretation is descriptive."
+      )
+    )
+  }
+  
+  # ---------- Table 3 narrative ----------
+  if (is_id) {
+    table3 <- c(
+      paste0(
+        "Tabel data grafik disajikan dalam format panjang dan menjadi sumber langsung pembentukan stacked bar chart. ",
+        "Setiap baris merepresentasikan kombinasi item pertanyaan, kelompok split, dan kategori respons, disertai nilai frekuensi, total respons valid, serta persentase. ",
+        "Dengan demikian, angka pada tabel ini konsisten dengan nilai yang digunakan dalam visualisasi."
+      )
+    )
+  } else {
+    table3 <- c(
+      paste0(
+        "The chart-data table is presented in long format and serves as the direct source for the stacked bar chart. ",
+        "Each row represents a combination of question item, split group, and response category, together with frequency, valid-response total, and percentage. ",
+        "Therefore, the values in this table are synchronized with those used in the visualization."
+      )
+    )
+  }
+  
+  list(
+    table1 = table1,
+    table2 = table2,
+    figure1 = figure1,
+    table3 = table3
+  )
+}
+
+
+# ============================================================
+# ROBUST EXPORT HELPERS - SESSION TEMP FILE + BROWSER BLOB
 # ============================================================
 
 make_export_filename <- function(prefix, ext = "png", dpi = NULL) {
@@ -621,18 +1013,75 @@ new_export_result <- function(path, filename, message) {
   )
 }
 
+# Send an already-generated binary file directly to the browser as a Blob.
+# This bypasses downloadHandler URLs and the Shinylive Service Worker
+# download routing that can produce "Couldn't find parent page" errors.
+send_binary_file_to_browser <- function(session,
+                                        path,
+                                        filename,
+                                        mime = "application/octet-stream",
+                                        max_mb = 25) {
+  validate_export_file(path)
+  
+  size_bytes <- file.info(path)$size
+  if (is.na(size_bytes) || size_bytes <= 0) {
+    stop("The generated file is empty.")
+  }
+  
+  if (size_bytes > max_mb * 1024^2) {
+    stop(
+      sprintf(
+        paste0(
+          "The generated file is %.1f MB, which is too large for the ",
+          "browser Blob transfer (limit %.0f MB). Reduce PNG DPI/size ",
+          "or omit very large raw-data appendices and try again."
+        ),
+        size_bytes / 1024^2,
+        max_mb
+      )
+    )
+  }
+  
+  encoded <- base64enc::base64encode(path, linewidth = 0)
+  
+  session$sendCustomMessage(
+    "statcal_binary_download",
+    list(
+      filename = filename,
+      mime = mime,
+      data = encoded
+    )
+  )
+  
+  invisible(TRUE)
+}
+
 generated_download_ui <- function(result, download_id, button_label, icon_name = "download") {
   if (is.null(result)) {
-    return(tags$p(class = "small-note", "Click Generate first. After the file is successfully created and verified, the download button will appear."))
+    return(
+      tags$p(
+        class = "small-note",
+        "Click Generate first. After the file has been created and verified, the download button will appear."
+      )
+    )
   }
+  
   if (!isTRUE(result$ok)) {
     return(tags$div(class = "alert alert-danger", result$message))
   }
+  
   tagList(
-    tags$div(class = "alert alert-success",
-             tags$b(result$message), tags$br(),
-             tags$span(sprintf("File: %s (%.1f KB)", result$filename, result$size / 1024))),
-    downloadButton(download_id, tagList(icon(icon_name), button_label))
+    tags$div(
+      class = "alert alert-success",
+      tags$b(result$message),
+      tags$br(),
+      tags$span(sprintf("File: %s (%.1f KB)", result$filename, result$size / 1024))
+    ),
+    actionButton(
+      download_id,
+      tagList(icon(icon_name), button_label),
+      class = "btn-primary"
+    )
   )
 }
 
@@ -675,7 +1124,7 @@ export_likert_workbook <- function(file, raw_df, frequency_df, split_df, chart_d
   write_table_sheet(wb, "Frequency Table", frequency_df, table1_title)
   write_table_sheet(wb, "Split Frequency Table", split_df, table2_title)
   write_table_sheet(wb, "Chart Data", chart_df, table3_title)
-
+  
   tmp_png <- tempfile(fileext = ".png")
   on.exit(unlink(tmp_png), add = TRUE)
   generate_plot_png(plot_object, tmp_png, width = export_width, height = export_height, dpi = 300, bg = "white")
@@ -686,7 +1135,7 @@ export_likert_workbook <- function(file, raw_df, frequency_df, split_df, chart_d
   openxlsx::insertImage(wb, "Figure 1", tmp_png, startRow = 3, startCol = 1,
                         width = min(safe_number(export_width, 8, 4, 16), 12),
                         height = min(safe_number(export_height, 6, 3, 14), 10), units = "in")
-
+  
   openxlsx::saveWorkbook(wb, file, overwrite = TRUE)
   validate_export_file(file, "Excel workbook")
 }
@@ -706,6 +1155,11 @@ export_word_report <- function(file, report_title, report_subtitle,
                                metadata_df, frequency_df, split_df, chart_df, raw_df,
                                plot_object, table1_title, table2_title, table3_title, figure1_title,
                                include_chart_data = TRUE, include_raw_data = FALSE,
+                               include_interpretation = TRUE,
+                               table1_narrative = character(0),
+                               table2_narrative = character(0),
+                               figure1_narrative = character(0),
+                               table3_narrative = character(0),
                                plot_width = 6.4, plot_height = 4.5) {
   doc <- officer::read_docx()
   doc <- officer::body_add_par(doc, report_title, style = "heading 1")
@@ -713,33 +1167,45 @@ export_word_report <- function(file, report_title, report_subtitle,
     doc <- officer::body_add_par(doc, report_subtitle, style = "Normal")
   }
   doc <- officer::body_add_par(doc, paste("Generated by STATCAL ONLINE on", format(Sys.time(), "%d %B %Y %H:%M")), style = "Normal")
-
+  
   doc <- officer::body_add_par(doc, "Analysis Settings", style = "heading 2")
   doc <- flextable::body_add_flextable(doc, make_report_flextable(metadata_df, 8))
-
+  
   doc <- officer::body_add_par(doc, table1_title, style = "heading 2")
   doc <- flextable::body_add_flextable(doc, make_report_flextable(frequency_df, 7.5))
-
+  if (isTRUE(include_interpretation)) {
+    doc <- add_word_paragraphs(doc, table1_narrative)
+  }
+  
   doc <- officer::body_add_par(doc, table2_title, style = "heading 2")
   doc <- flextable::body_add_flextable(doc, make_report_flextable(split_df, 7.2))
-
+  if (isTRUE(include_interpretation)) {
+    doc <- add_word_paragraphs(doc, table2_narrative)
+  }
+  
   tmp_png <- tempfile(fileext = ".png")
   on.exit(unlink(tmp_png), add = TRUE)
   generate_plot_png(plot_object, tmp_png, width = plot_width, height = plot_height, dpi = 300, bg = "white")
   doc <- officer::body_add_par(doc, figure1_title, style = "heading 2")
   doc <- officer::body_add_img(doc, src = tmp_png, width = plot_width, height = plot_height)
-
+  if (isTRUE(include_interpretation)) {
+    doc <- add_word_paragraphs(doc, figure1_narrative)
+  }
+  
   if (isTRUE(include_chart_data)) {
     doc <- officer::body_add_par(doc, table3_title, style = "heading 2")
     doc <- flextable::body_add_flextable(doc, make_report_flextable(chart_df, 7.2))
+    if (isTRUE(include_interpretation)) {
+      doc <- add_word_paragraphs(doc, table3_narrative)
+    }
   }
-
+  
   if (isTRUE(include_raw_data)) {
     doc <- officer::body_add_break(doc)
     doc <- officer::body_add_par(doc, "Appendix A. Raw Data", style = "heading 2")
     doc <- flextable::body_add_flextable(doc, make_report_flextable(raw_df, 6.8))
   }
-
+  
   print(doc, target = file)
   validate_export_file(file, "Word report")
 }
@@ -755,7 +1221,53 @@ ui <- dashboardPage(
   dashboardSidebar(disable = TRUE),
   dashboardBody(
     tags$head(
-      tags$style(HTML("\n        .content-wrapper, .right-side { background-color: #f7f9fb; }\n        .box { border-radius: 10px; }\n        .statcal-title { font-size: 24px; font-weight: 700; color: #1F4E79; }\n        .statcal-subtitle { font-size: 18px; font-weight: 600; color: #333333; }\n        .statcal-note { line-height: 1.6; text-align: justify; }\n        .small-note { font-size: 12px; color: #666666; }\n      "))
+      tags$style(HTML("\n        .content-wrapper, .right-side { background-color: #f7f9fb; }\n        .box { border-radius: 10px; }\n        .statcal-title { font-size: 24px; font-weight: 700; color: #1F4E79; }\n        .statcal-subtitle { font-size: 18px; font-weight: 600; color: #333333; }\n        .statcal-note { line-height: 1.6; text-align: justify; }\n        .small-note { font-size: 12px; color: #666666; }\n      ")),
+      tags$script(HTML("
+        (function registerStatcalBinaryDownload() {
+          if (!window.Shiny || !Shiny.addCustomMessageHandler) {
+            window.setTimeout(registerStatcalBinaryDownload, 50);
+            return;
+          }
+
+          Shiny.addCustomMessageHandler('statcal_binary_download', function(message) {
+            try {
+              var binary = window.atob(message.data || '');
+              var len = binary.length;
+              var bytes = new Uint8Array(len);
+
+              for (var i = 0; i < len; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+
+              var blob = new Blob(
+                [bytes],
+                { type: message.mime || 'application/octet-stream' }
+              );
+
+              var url = window.URL.createObjectURL(blob);
+              var a = document.createElement('a');
+
+              a.style.display = 'none';
+              a.href = url;
+              a.download = message.filename || 'statcal_download.bin';
+
+              document.body.appendChild(a);
+              a.click();
+
+              window.setTimeout(function() {
+                window.URL.revokeObjectURL(url);
+                if (a.parentNode) {
+                  a.parentNode.removeChild(a);
+                }
+              }, 1500);
+
+            } catch (err) {
+              console.error('STATCAL binary download failed:', err);
+              window.alert('Download failed in the browser: ' + err.message);
+            }
+          });
+        })();
+      "))
     ),
     fluidRow(
       box(
@@ -900,23 +1412,45 @@ ui <- dashboardPage(
                 column(6, textInput("table3_title", "Table 3 title", value = "Table 3. Data Used to Create the Stacked Bar Chart")),
                 column(6, textInput("figure1_title", "Figure 1 title", value = "Figure 1. Likert Scale Distribution Stacked Bar Chart"))
               ),
+              checkboxInput(
+                "word_include_interpretation",
+                "Include automatic interpretation below each result table and figure",
+                value = TRUE
+              ),
+              selectInput(
+                "word_interpretation_language",
+                "Automatic interpretation language",
+                choices = c("Bahasa Indonesia", "English"),
+                selected = "Bahasa Indonesia"
+              ),
               checkboxInput("word_include_chart_data", "Include Chart Data table in Word", value = TRUE),
               checkboxInput("word_include_raw_data", "Include Raw Data appendix in Word", value = FALSE),
-              tags$p(class = "small-note", "Generated files are first created in a writable session temporary folder, verified, and then delivered through Shiny downloadHandler. This is more reliable than writing dynamically to www/."))
+              tags$p(
+                class = "small-note",
+                "Automatic interpretation is descriptive. It summarizes the observed Likert distributions and does not imply statistical significance or causal relationships."
+              ),
+              tags$p(
+                class = "small-note",
+                paste0(
+                  "Generated files are created and verified inside the webR session, ",
+                  "then delivered directly to the browser as binary Blob downloads. ",
+                  "This avoids Shinylive/GitHub Pages Service Worker download errors."
+                )
+              ))
         ),
         fluidRow(
           box(width = 4, title = "Stacked Bar Chart PNG", status = "warning", solidHeader = TRUE,
               actionButton("generate_chart_png", "Generate PNG", icon = icon("image")),
               br(), br(), uiOutput("chart_generated_download_ui"),
-              br(), downloadButton("download_chart_fallback", "Direct / Fallback PNG")),
+              br(), actionButton("download_chart_fallback", "Generate & Download PNG", icon = icon("download"))),
           box(width = 4, title = "Analysis Excel", status = "success", solidHeader = TRUE,
               actionButton("generate_excel", "Generate Analysis Excel", icon = icon("file-excel")),
               br(), br(), uiOutput("excel_generated_download_ui"),
-              br(), downloadButton("download_excel_fallback", "Direct / Fallback Excel")),
+              br(), actionButton("download_excel_fallback", "Generate & Download Excel", icon = icon("download"))),
           box(width = 4, title = "Analysis Word", status = "info", solidHeader = TRUE,
               actionButton("generate_word", "Generate Analysis Word", icon = icon("file-word")),
               br(), br(), uiOutput("word_generated_download_ui"),
-              br(), downloadButton("download_word_fallback", "Direct / Fallback Word"))
+              br(), actionButton("download_word_fallback", "Generate & Download Word", icon = icon("download")))
         )
       )
     )
@@ -932,11 +1466,11 @@ server <- function(input, output, session) {
   excel_export_result <- reactiveVal(NULL)
   word_export_result <- reactiveVal(NULL)
   session_export_dir <- create_session_export_dir(session$token)
-
+  
   session$onSessionEnded(function() {
     try(unlink(session_export_dir, recursive = TRUE, force = TRUE), silent = TRUE)
   })
-
+  
   output$chart_generated_download_ui <- renderUI({
     generated_download_ui(chart_export_result(), "download_chart_generated", "Download Generated PNG", "image")
   })
@@ -946,7 +1480,7 @@ server <- function(input, output, session) {
   output$word_generated_download_ui <- renderUI({
     generated_download_ui(word_export_result(), "download_word_generated", "Download Generated Word", "file-word")
   })
-
+  
   current_excel_path <- reactive({
     if (!is.null(input$uploaded_file)) {
       input$uploaded_file$datapath
@@ -956,14 +1490,14 @@ server <- function(input, output, session) {
       NULL
     }
   })
-
+  
   output$sheet_ui <- renderUI({
     path <- current_excel_path()
     if (is.null(path)) return(helpText("Please upload an Excel file to start the analysis."))
     sheets <- readxl::excel_sheets(path)
     selectInput("sheet_name", "Worksheet", choices = sheets, selected = sheets[1])
   })
-
+  
   data_raw <- reactive({
     path <- current_excel_path()
     req(path)
@@ -972,21 +1506,21 @@ server <- function(input, output, session) {
     if (is.null(sheet) || !(sheet %in% sheets)) sheet <- sheets[1]
     clean_dataframe(readxl::read_excel(path, sheet = sheet))
   })
-
+  
   likert_levels <- reactive({
     parse_likert_levels(input$likert_order_text)
   })
-
+  
   likely_item_columns <- reactive({
     detect_likert_item_columns(data_raw(), likert_levels())
   })
-
+  
   selected_items <- reactive({
     vals <- input$item_cols
     if (is.null(vals) || length(vals) == 0) vals <- likely_item_columns()
     vals[vals %in% names(data_raw())]
   })
-
+  
   output$item_vars_ui <- renderUI({
     df <- data_raw()
     defaults <- likely_item_columns()
@@ -994,7 +1528,7 @@ server <- function(input, output, session) {
     selectizeInput("item_cols", "Select item question variables", choices = names(df), selected = defaults, multiple = TRUE,
                    options = list(plugins = list("remove_button")))
   })
-
+  
   output$split_var_ui <- renderUI({
     df <- data_raw()
     choices <- c("None", setdiff(names(df), selected_items()))
@@ -1002,7 +1536,7 @@ server <- function(input, output, session) {
     preferred <- if (!is.null(current) && current %in% choices) current else if ("Jenis Kelamin" %in% choices) "Jenis Kelamin" else if ("Pendidikan" %in% choices) "Pendidikan" else "None"
     selectInput("split_var", "Split by one categorical variable", choices = choices, selected = preferred)
   })
-
+  
   output$split_order_ui <- renderUI({
     df <- data_raw()
     split_col <- input$split_var
@@ -1012,7 +1546,7 @@ server <- function(input, output, session) {
     split_values <- sorted_unique_values(as.character(df[[split_col]]))
     textInput("split_order_text", "Split category order for table and panels (comma-separated)", value = paste(split_values, collapse = ", "))
   })
-
+  
   output$palette_preview_ui <- renderUI({
     levels <- likert_levels()
     palette_name <- input$chart_palette
@@ -1027,7 +1561,7 @@ server <- function(input, output, session) {
       })
     )
   })
-
+  
   output$color_settings_ui <- renderUI({
     levels <- likert_levels()
     if (!identical(input$chart_palette, "Manual / Custom")) {
@@ -1038,40 +1572,40 @@ server <- function(input, output, session) {
       colourpicker::colourInput(color_input_id(levels[i]), paste0("Color for ", levels[i]), value = defaults[i], showColour = "both")
     }))
   })
-
+  
   output$legend_label_settings_ui <- renderUI({
     levels <- likert_levels()
     tagList(lapply(levels, function(lv) {
       textInput(legend_input_id(lv), paste0("Legend label for ", lv), value = default_legend_label(lv))
     }))
   })
-
+  
   output$metric_rows <- renderValueBox({ valueBox(nrow(data_raw()), "Rows", icon = icon("table"), color = "blue") })
   output$metric_columns <- renderValueBox({ valueBox(ncol(data_raw()), "Columns", icon = icon("columns"), color = "yellow") })
   output$metric_items <- renderValueBox({ valueBox(length(selected_items()), "Selected item questions", icon = icon("list"), color = "green") })
   output$metric_levels <- renderValueBox({ valueBox(length(likert_levels()), "Likert labels", icon = icon("sort"), color = "purple") })
-
+  
   output$data_preview <- renderDT({
     DT::datatable(make_display_safe(data_raw()), options = list(scrollX = TRUE, pageLength = 10))
   })
-
+  
   frequency_chart_data <- reactive({
     build_likert_long_data(data_raw(), selected_items(), likert_levels(), split_col = "None", digits = input$decimal_digits)
   })
-
+  
   chart_data <- reactive({
     build_likert_long_data(data_raw(), selected_items(), likert_levels(), input$split_var, input$decimal_digits, input$split_order_text)
   })
-
+  
   frequency_table_data <- reactive({
     format_likert_wide_table_from_long(frequency_chart_data(), likert_levels(), input$decimal_digits, include_split = FALSE)
   })
-
+  
   split_table_data <- reactive({
     if (is.null(input$split_var) || input$split_var == "None" || !(input$split_var %in% names(data_raw()))) return(frequency_table_data())
     format_likert_wide_table_from_long(chart_data(), likert_levels(), input$decimal_digits, split_col = input$split_var, include_split = TRUE)
   })
-
+  
   stacked_bar_plot_object <- reactive({
     create_stacked_bar_plot(
       chart_df = chart_data(),
@@ -1106,7 +1640,7 @@ server <- function(input, output, session) {
       digits = input$decimal_digits
     )
   })
-
+  
   output$frequency_table <- renderDT({
     DT::datatable(make_display_safe(frequency_table_data()), options = list(scrollX = TRUE, pageLength = 15))
   })
@@ -1120,7 +1654,7 @@ server <- function(input, output, session) {
   output$chart_data_table <- renderDT({
     DT::datatable(make_display_safe(chart_data()), options = list(scrollX = TRUE, pageLength = 15))
   })
-
+  
   build_export_metadata <- reactive({
     split_order_value <- if (is.null(input$split_order_text)) "" else as.character(input$split_order_text)
     split_var_value <- if (is.null(input$split_var)) "None" else as.character(input$split_var)
@@ -1140,7 +1674,7 @@ server <- function(input, output, session) {
       stringsAsFactors = FALSE
     )
   })
-
+  
   export_current_excel <- function(file) {
     export_likert_workbook(
       file = file,
@@ -1158,7 +1692,21 @@ server <- function(input, output, session) {
       export_height = input$export_height
     )
   }
-
+  
+  word_narratives <- reactive({
+    build_likert_word_narratives(
+      overall_long_df = frequency_chart_data(),
+      split_long_df = chart_data(),
+      levels = likert_levels(),
+      legend_labels = get_legend_labels(likert_levels(), input),
+      split_var = ifelse(is.null(input$split_var), "None", input$split_var),
+      digits = input$decimal_digits,
+      chart_metric = input$chart_y_metric,
+      facet_by_split = isTRUE(input$chart_facet_split),
+      language = input$word_interpretation_language
+    )
+  })
+  
   export_current_word <- function(file) {
     word_width <- min(safe_number(input$export_width, 8, 4, 12), 6.5)
     ratio <- safe_number(input$export_height, 6, 3, 20) / safe_number(input$export_width, 8, 4, 30)
@@ -1179,11 +1727,16 @@ server <- function(input, output, session) {
       figure1_title = input$figure1_title,
       include_chart_data = isTRUE(input$word_include_chart_data),
       include_raw_data = isTRUE(input$word_include_raw_data),
+      include_interpretation = isTRUE(input$word_include_interpretation),
+      table1_narrative = word_narratives()$table1,
+      table2_narrative = word_narratives()$table2,
+      figure1_narrative = word_narratives()$figure1,
+      table3_narrative = word_narratives()$table3,
       plot_width = word_width,
       plot_height = word_height
     )
   }
-
+  
   make_result_safe <- function(expr, filename, success_message) {
     tryCatch({
       path <- file.path(session_export_dir, filename)
@@ -1193,7 +1746,7 @@ server <- function(input, output, session) {
       list(ok = FALSE, message = paste("Export failed:", conditionMessage(e)), file = NULL, filename = filename, size = 0)
     })
   }
-
+  
   observeEvent(input$generate_chart_png, {
     filename <- make_export_filename("statcal_likert_stacked_bar_chart", "png", input$export_dpi)
     result <- make_result_safe(
@@ -1203,58 +1756,168 @@ server <- function(input, output, session) {
     )
     chart_export_result(result)
   })
-
+  
   observeEvent(input$generate_excel, {
     filename <- make_export_filename("statcal_likert_analysis", "xlsx")
     result <- make_result_safe(function(path) export_current_excel(path), filename, "Excel workbook has been generated and verified successfully.")
     excel_export_result(result)
   })
-
+  
   observeEvent(input$generate_word, {
     filename <- make_export_filename("statcal_likert_analysis_report", "docx")
-    result <- make_result_safe(function(path) export_current_word(path), filename, "Word report has been generated and verified successfully.")
+    result <- make_result_safe(function(path) export_current_word(path), filename, "Word report with automatic interpretation has been generated and verified successfully.")
     word_export_result(result)
   })
-
-  output$download_chart_generated <- downloadHandler(
-    filename = function() { req(chart_export_result()); chart_export_result()$filename },
-    contentType = "image/png",
-    content = function(file) {
-      res <- chart_export_result(); req(res, isTRUE(res$ok), file.exists(res$file)); file.copy(res$file, file, overwrite = TRUE)
+  
+  # ----------------------------------------------------------
+  # BROWSER BLOB DOWNLOADS (SHINYLIVE / GITHUB PAGES)
+  # ----------------------------------------------------------
+  # Generated files live inside webR's virtual filesystem.
+  # They are encoded as Base64, sent to JavaScript, reconstructed as a
+  # binary Blob, and downloaded by the browser. No downloadHandler URL
+  # or Service Worker download route is required.
+  
+  send_result_safely <- function(result, mime) {
+    tryCatch({
+      req(
+        result,
+        isTRUE(result$ok),
+        !is.null(result$file),
+        file.exists(result$file)
+      )
+      
+      send_binary_file_to_browser(
+        session = session,
+        path = result$file,
+        filename = result$filename,
+        mime = mime
+      )
+      
+    }, error = function(e) {
+      showNotification(
+        paste("Download failed:", conditionMessage(e)),
+        type = "error",
+        duration = NULL
+      )
+    })
+  }
+  
+  # Download a file that has already been generated and verified.
+  observeEvent(input$download_chart_generated, {
+    send_result_safely(
+      chart_export_result(),
+      "image/png"
+    )
+  }, ignoreInit = TRUE)
+  
+  observeEvent(input$download_excel_generated, {
+    send_result_safely(
+      excel_export_result(),
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+  }, ignoreInit = TRUE)
+  
+  observeEvent(input$download_word_generated, {
+    send_result_safely(
+      word_export_result(),
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+  }, ignoreInit = TRUE)
+  
+  # ----------------------------------------------------------
+  # ONE-CLICK GENERATE + DOWNLOAD
+  # ----------------------------------------------------------
+  
+  observeEvent(input$download_chart_fallback, {
+    filename <- make_export_filename(
+      "statcal_likert_stacked_bar_chart",
+      "png",
+      input$export_dpi
+    )
+    
+    result <- make_result_safe(
+      function(path) {
+        generate_plot_png(
+          stacked_bar_plot_object(),
+          path,
+          input$export_width,
+          input$export_height,
+          input$export_dpi,
+          safe_theme_bg(input$chart_theme)
+        )
+      },
+      filename,
+      "PNG figure has been generated and verified successfully."
+    )
+    
+    chart_export_result(result)
+    
+    if (isTRUE(result$ok)) {
+      send_result_safely(result, "image/png")
+    } else {
+      showNotification(
+        result$message,
+        type = "error",
+        duration = NULL
+      )
     }
-  )
-  output$download_excel_generated <- downloadHandler(
-    filename = function() { req(excel_export_result()); excel_export_result()$filename },
-    contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    content = function(file) {
-      res <- excel_export_result(); req(res, isTRUE(res$ok), file.exists(res$file)); file.copy(res$file, file, overwrite = TRUE)
+  }, ignoreInit = TRUE)
+  
+  observeEvent(input$download_excel_fallback, {
+    filename <- make_export_filename(
+      "statcal_likert_analysis",
+      "xlsx"
+    )
+    
+    result <- make_result_safe(
+      function(path) export_current_excel(path),
+      filename,
+      "Excel workbook has been generated and verified successfully."
+    )
+    
+    excel_export_result(result)
+    
+    if (isTRUE(result$ok)) {
+      send_result_safely(
+        result,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      )
+    } else {
+      showNotification(
+        result$message,
+        type = "error",
+        duration = NULL
+      )
     }
-  )
-  output$download_word_generated <- downloadHandler(
-    filename = function() { req(word_export_result()); word_export_result()$filename },
-    contentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    content = function(file) {
-      res <- word_export_result(); req(res, isTRUE(res$ok), file.exists(res$file)); file.copy(res$file, file, overwrite = TRUE)
+  }, ignoreInit = TRUE)
+  
+  observeEvent(input$download_word_fallback, {
+    filename <- make_export_filename(
+      "statcal_likert_analysis_report",
+      "docx"
+    )
+    
+    result <- make_result_safe(
+      function(path) export_current_word(path),
+      filename,
+      "Word report with automatic interpretation has been generated and verified successfully."
+    )
+    
+    word_export_result(result)
+    
+    if (isTRUE(result$ok)) {
+      send_result_safely(
+        result,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      )
+    } else {
+      showNotification(
+        result$message,
+        type = "error",
+        duration = NULL
+      )
     }
-  )
-
-  output$download_chart_fallback <- downloadHandler(
-    filename = function() make_export_filename("statcal_likert_stacked_bar_chart", "png", input$export_dpi),
-    contentType = "image/png",
-    content = function(file) {
-      generate_plot_png(stacked_bar_plot_object(), file, input$export_width, input$export_height, input$export_dpi, safe_theme_bg(input$chart_theme))
-    }
-  )
-  output$download_excel_fallback <- downloadHandler(
-    filename = function() make_export_filename("statcal_likert_analysis", "xlsx"),
-    contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    content = function(file) export_current_excel(file)
-  )
-  output$download_word_fallback <- downloadHandler(
-    filename = function() make_export_filename("statcal_likert_analysis_report", "docx"),
-    contentType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    content = function(file) export_current_word(file)
-  )
+  }, ignoreInit = TRUE)
 }
 
 shinyApp(ui = ui, server = server)

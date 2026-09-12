@@ -1,4 +1,4 @@
-setwd("D:/MODUL STATCAL 2026/Website Materi Praktek Olah Data STATCAL DASAR/visualisasi data skala likert/shiny")
+setwd("D:/MODUL STATCAL 2026/shiny skala likert")
 
 
 
